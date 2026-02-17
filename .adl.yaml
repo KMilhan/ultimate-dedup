@@ -1,0 +1,330 @@
+---
+adl-version: "0.1"
+name: "Ultimate Dedup"
+description: >-
+  Command-line utility that detects duplicate files strictly by file contents
+  and reclaims disk space safely in batch operations, including directional
+  mode that deletes files in source directory A when identical content exists
+  in reference directory B.
+
+stakeholders:
+  - id: sh-1
+    name: "CLI Users"
+    description: "Run scans and dedup jobs on local or mounted filesystems."
+  - id: sh-2
+    name: "Operators"
+    description: "Schedule and monitor recurring dedup jobs across directories."
+  - id: sh-3
+    name: "Development Team"
+    description: "Builds and maintains the scanner, planner, and executor."
+  - id: sh-4
+    name: "Security And Compliance"
+    description: "Requires deterministic, auditable, low-risk file operations."
+
+concerns:
+  - id: C-1
+    name: "Content Correctness"
+    description: "Treat files as duplicates only when contents are exactly equal."
+  - id: C-2
+    name: "Space Reclamation"
+    description: "Recover meaningful disk space from duplicate file sets."
+  - id: C-3
+    name: "Performance At Scale"
+    description: "Handle large trees without unnecessary reads and memory usage."
+  - id: C-4
+    name: "Operational Safety"
+    description: "Avoid destructive mistakes and support dry runs and rollback."
+  - id: C-5
+    name: "Cross-Filesystem Behavior"
+    description: "Handle filesystem constraints and platform differences safely."
+  - id: C-6
+    name: "Auditability"
+    description: "Provide logs and summaries of scanned and mutated files."
+  - id: C-7
+    name: "Directional Safety"
+    description: "Mutate only source directory A while using directory B as immutable reference."
+
+viewpoints:
+  - id: VP-1
+    name: "System Context"
+    description: "Actors, filesystems, and outputs around the dedup utility."
+    stakeholders:
+      - sh-1
+      - sh-2
+      - sh-4
+    concerns:
+      - C-1
+      - C-2
+      - C-4
+      - C-6
+      - C-7
+  - id: VP-2
+    name: "Dedup Processing"
+    description: "Pipeline from discovery to content validation and planning."
+    stakeholders:
+      - sh-1
+      - sh-3
+    concerns:
+      - C-1
+      - C-2
+      - C-3
+      - C-7
+  - id: VP-3
+    name: "Runtime And State"
+    description: "Execution model, local state, and filesystem interactions."
+    stakeholders:
+      - sh-2
+      - sh-3
+      - sh-4
+    concerns:
+      - C-3
+      - C-4
+      - C-5
+      - C-6
+      - C-7
+
+views:
+  - id: V-1.1
+    name: "System Context"
+    description: "Ultimate Dedup in relation to users and filesystems."
+    conforms-to-viewpoint: VP-1
+    addresses-concerns:
+      - C-1
+      - C-2
+      - C-4
+      - C-6
+    elements:
+      - id: actor-user
+        name: "CLI User"
+        type: "Person"
+        description: "Invokes scans, previews results, and applies dedup in batches."
+      - id: actor-operator
+        name: "Operator"
+        type: "Person"
+        description: "Runs scheduled jobs and checks reports."
+      - id: system-ultimate-dedup
+        name: "Ultimate Dedup CLI"
+        type: "System"
+        description: >-
+          Scans files, detects duplicates by content, and executes batch
+          reclamation where source A files can be removed if content exists in
+          reference B.
+      - id: ext-filesystem
+        name: "Filesystem"
+        type: "External System"
+        description: "Provides files, metadata, and storage semantics."
+      - id: ext-stdout
+        name: "Console And Reports"
+        type: "External Interface"
+        description: "Human-readable output and machine-readable run summaries."
+    relationships:
+      - from: actor-user
+        to: system-ultimate-dedup
+        description: "Runs commands and confirms execution modes."
+      - from: actor-operator
+        to: system-ultimate-dedup
+        description: "Runs batch jobs and consumes execution summaries."
+      - from: system-ultimate-dedup
+        to: ext-filesystem
+        description: "Reads content from source A and reference B; mutates only source A."
+      - from: system-ultimate-dedup
+        to: ext-stdout
+        description: "Prints plans, dry-run previews, and final savings."
+    references:
+      - path: main.go
+      - path: internal/cli/cli.go
+      - path: internal/dedup/engine.go
+
+  - id: V-2.1
+    name: "Dedup Processing Pipeline"
+    description: "Deterministic pipeline for content-based duplicate detection."
+    conforms-to-viewpoint: VP-2
+    addresses-concerns:
+      - C-1
+      - C-2
+      - C-3
+    elements:
+      - id: pipeline-walker
+        name: "File Walker"
+        type: "Component"
+        responsibilities:
+          - "Recursively enumerate files under configured paths"
+          - "Capture path, size, inode/device metadata"
+      - id: pipeline-size-bucket
+        name: "Size Bucket Index"
+        type: "Component"
+        responsibilities:
+          - "Collect source A sizes to prefilter reference B"
+          - "Discard non-candidate sizes from further hashing"
+      - id: pipeline-hasher
+        name: "Content Hasher"
+        type: "Component"
+        responsibilities:
+          - "Compute cryptographic hash for candidate files in both A and B"
+          - "Support streaming reads for large files"
+      - id: pipeline-verifier
+        name: "Byte Verifier"
+        type: "Component"
+        responsibilities:
+          - "Byte-compare A candidates against B candidates before mutation"
+          - "Eliminate residual collision risk"
+      - id: pipeline-planner
+        name: "Batch Planner"
+        type: "Component"
+        responsibilities:
+          - "Select source A files that are safe to remove"
+          - "Create bounded execution batches and projected savings"
+      - id: pipeline-executor
+        name: "Dedup Executor"
+        type: "Component"
+        responsibilities:
+          - "Delete selected source A files in batches"
+          - "Emit per-file result and aggregate savings"
+    relationships:
+      - from: pipeline-walker
+        to: pipeline-size-bucket
+        description: "Streams discovered file metadata into size groups."
+      - from: pipeline-size-bucket
+        to: pipeline-hasher
+        description: "Submits only colliding-size groups for hashing."
+      - from: pipeline-hasher
+        to: pipeline-verifier
+        description: "Sends same-hash candidates for full-byte validation."
+      - from: pipeline-verifier
+        to: pipeline-planner
+        description: "Produces confirmed duplicate sets."
+      - from: pipeline-planner
+        to: pipeline-executor
+        description: "Executes dedup operations in configured batch sizes."
+    references:
+      - path: internal/dedup/engine.go
+
+  - id: V-3.1
+    name: "Runtime And Safety"
+    description: "Execution controls for predictable, auditable mutation."
+    conforms-to-viewpoint: VP-3
+    addresses-concerns:
+      - C-3
+      - C-4
+      - C-5
+      - C-6
+    elements:
+      - id: runtime-cli
+        name: "CLI Runtime"
+        type: "Process"
+        description: "Single process coordinating scan, plan, and execute phases."
+      - id: runtime-job-log
+        name: "Operation Journal"
+        type: "Data Store"
+        description: "Append-only log of planned and completed file mutations."
+      - id: runtime-dry-run
+        name: "Dry Run Mode"
+        type: "Control"
+        description: "Produces plans and savings without mutating files."
+      - id: runtime-batch-limit
+        name: "Batch Limit Control"
+        type: "Control"
+        description: "Caps mutations per run for operational safety."
+      - id: runtime-filesystem-guard
+        name: "Filesystem Guard"
+        type: "Control"
+        description: "Rejects unsupported cross-device or permission-unsafe mutations."
+    relationships:
+      - from: runtime-cli
+        to: runtime-dry-run
+        description: "Runs preview-only workflow when enabled."
+      - from: runtime-cli
+        to: runtime-batch-limit
+        description: "Applies bounded execution limits."
+      - from: runtime-cli
+        to: runtime-filesystem-guard
+        description: "Checks each mutation before execution."
+      - from: runtime-cli
+        to: runtime-job-log
+        description: "Persists intent and outcomes for audit and rollback."
+    references:
+      - path: internal/cli/cli.go
+      - path: internal/dedup/engine.go
+
+rationale:
+  adrs:
+    - id: ADR-1
+      name: "Duplicate Identity Defined By Content Only"
+      status: "Accepted"
+      context: "The tool must ignore names, paths, timestamps, and permissions when detecting duplicates."
+      decision: "Define duplicate equality as exact byte-for-byte content equality."
+      consequences:
+        - "Metadata differences do not prevent dedup when content matches."
+        - "Pipeline includes explicit byte verification before mutation."
+      affected-views:
+        - id: V-1.1
+        - id: V-2.1
+    - id: ADR-2
+      name: "Size Filter Before Hashing"
+      status: "Accepted"
+      context: "Hashing every file is unnecessary and expensive for large datasets."
+      decision: "Group files by size first; hash only files in size buckets with more than one member."
+      consequences:
+        - "Total bytes hashed are significantly reduced."
+        - "Large scans stay practical on commodity storage."
+      affected-views:
+        - id: V-2.1
+    - id: ADR-3
+      name: "Cryptographic Hash Plus Byte Verification"
+      status: "Accepted"
+      context: "Hash collisions are rare but non-zero in theory."
+      decision: "Use a cryptographic hash for candidate grouping and require full-byte compare before dedup action."
+      consequences:
+        - "False-positive dedup from collision is prevented."
+        - "Verification cost applies only to same-hash candidates."
+      affected-views:
+        - id: V-2.1
+    - id: ADR-6
+      name: "Directional A-By-B Delete Mode"
+      status: "Accepted"
+      context: "Primary operation is deleting files in A that already exist in B by content."
+      decision: "Treat A as mutable source and B as immutable reference during a run."
+      consequences:
+        - "No files in B are modified by this mode."
+        - "Operational intent is explicit and lower risk than bidirectional dedup."
+      affected-views:
+        - id: V-1.1
+        - id: V-2.1
+        - id: V-3.1
+    - id: ADR-7
+      name: "Parallel Hashing And Batched Deletion"
+      status: "Accepted"
+      context: "Fast execution is required for large directory trees."
+      decision: >-
+        Use worker pools for hashing and perform deletion in bounded batches;
+        default hash is xxh3-128 for speed, with optional sha256 and
+        byte-by-byte verification for correctness. If concurrency is not
+        supplied, auto-tune workers using a short (~1 second) probe.
+      consequences:
+        - "Throughput scales with available CPU and storage concurrency."
+        - "Batch boundaries provide progress checkpoints and reduced failure blast radius."
+        - "Default runs self-calibrate without requiring manual worker tuning."
+      affected-views:
+        - id: V-2.1
+        - id: V-3.1
+    - id: ADR-4
+      name: "Batch Execution With Journaled Operations"
+      status: "Accepted"
+      context: "Large one-shot mutation runs are risky and hard to recover from."
+      decision: "Execute dedup in bounded batches and persist operation outcomes in a journal."
+      consequences:
+        - "Runs can be resumed or audited after interruption."
+        - "Operational blast radius is limited by batch size."
+      affected-views:
+        - id: V-3.1
+    - id: ADR-5
+      name: "Safe-By-Default Mode"
+      status: "Accepted"
+      context: "Users need confidence before any irreversible file mutation."
+      decision: "Default to dry-run planning unless explicit apply mode is requested."
+      consequences:
+        - "Users can review duplicate groups and projected savings first."
+        - "Automation scripts must opt in to mutation mode intentionally."
+      affected-views:
+        - id: V-1.1
+        - id: V-3.1
