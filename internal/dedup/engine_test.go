@@ -3,6 +3,7 @@ package dedup
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -197,6 +198,8 @@ func TestRunValidationErrors(t *testing.T) {
 	cases := []Config{
 		{ReferenceDir: b},
 		{SourceDir: a},
+		{InPlace: true},
+		{SourceDir: a, ReferenceDir: b, InPlace: true},
 		{SourceDir: a, ReferenceDir: b, Workers: -1},
 		{SourceDir: a, ReferenceDir: b, BatchSize: -1},
 		{SourceDir: a, ReferenceDir: b, Hash: "bad"},
@@ -207,6 +210,78 @@ func TestRunValidationErrors(t *testing.T) {
 		if _, err := Run(cfg); err == nil {
 			t.Fatalf("case %d: expected error", i)
 		}
+	}
+}
+
+func TestRunInPlaceKeepsOneFilePerContentGroup(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "A")
+	mustMkdirAll(t, source)
+
+	keep := filepath.Join(source, "a.txt")
+	drop1 := filepath.Join(source, "b.txt")
+	drop2 := filepath.Join(source, "c.txt")
+	unique := filepath.Join(source, "unique.txt")
+
+	mustWriteFile(t, keep, []byte("dup"))
+	mustWriteFile(t, drop1, []byte("dup"))
+	mustWriteFile(t, drop2, []byte("dup"))
+	mustWriteFile(t, unique, []byte("other"))
+
+	planStats, err := Run(Config{
+		SourceDir: source,
+		InPlace:   true,
+		BatchSize: 2,
+		Workers:   1,
+		Hash:      HashXXH3_128,
+		Apply:     false,
+		Verify:    true,
+	})
+	if err != nil {
+		t.Fatalf("Run dry-run in-place returned error: %v", err)
+	}
+	if planStats.MatchedFiles != 2 {
+		t.Fatalf("expected 2 matched files in dry-run, got %d", planStats.MatchedFiles)
+	}
+	if planStats.BytesReclaimable != int64(len("dup")+len("dup")) {
+		t.Fatalf("unexpected reclaimable bytes: %d", planStats.BytesReclaimable)
+	}
+
+	for _, p := range []string{keep, drop1, drop2, unique} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("expected file to exist after dry-run: %s (%v)", p, err)
+		}
+	}
+
+	applyStats, err := Run(Config{
+		SourceDir: source,
+		InPlace:   true,
+		BatchSize: 1,
+		Workers:   1,
+		Hash:      HashXXH3_128,
+		Apply:     true,
+		Verify:    true,
+	})
+	if err != nil {
+		t.Fatalf("Run apply in-place returned error: %v", err)
+	}
+	if applyStats.DeletedFiles != 2 {
+		t.Fatalf("expected 2 deleted files, got %d", applyStats.DeletedFiles)
+	}
+	if applyStats.DeleteErrors != 0 {
+		t.Fatalf("expected 0 delete errors, got %d", applyStats.DeleteErrors)
+	}
+
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("expected keep file to remain: %v", err)
+	}
+	for _, p := range []string{drop1, drop2} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("expected duplicate file deleted: %s", p)
+		}
+	}
+	if _, err := os.Stat(unique); err != nil {
+		t.Fatalf("expected unique file to remain: %v", err)
 	}
 }
 
@@ -405,6 +480,27 @@ func TestAutoTuneWorkersFallbackBranches(t *testing.T) {
 	files := []fileMeta{{Path: path, Size: 3}}
 	if got := autoTuneWorkers(files, HashXXH3_128, 0); got < 1 {
 		t.Fatalf("expected fallback workers >=1 for zero budget, got %d", got)
+	}
+}
+
+func TestAutoTuneWorkersTieDoesNotStickToOne(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "f")
+	mustWriteFile(t, path, []byte("abc"))
+	files := []fileMeta{{Path: path, Size: 3}}
+
+	candidates := workerCandidates(runtime.NumCPU())
+	expected := 1
+	for _, c := range candidates {
+		if c > expected {
+			expected = c
+		}
+	}
+
+	// Unknown algorithm forces identical (zero) throughput for all candidates.
+	got := autoTuneWorkers(files, "unsupported", 80*time.Millisecond)
+	if got != expected {
+		t.Fatalf("expected highest candidate %d for tie throughput, got %d", expected, got)
 	}
 }
 

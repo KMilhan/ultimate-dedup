@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,7 @@ const defaultAutoTuneDuration = time.Second
 type Config struct {
 	SourceDir        string
 	ReferenceDir     string
+	InPlace          bool
 	BatchSize        int
 	Workers          int
 	Hash             string
@@ -87,9 +89,6 @@ func Run(cfg Config) (Stats, error) {
 	start := time.Now()
 	var stats Stats
 
-	if cfg.SourceDir == "" || cfg.ReferenceDir == "" {
-		return stats, errors.New("both --source and --reference are required")
-	}
 	if cfg.Workers < 0 {
 		return stats, errors.New("--workers must be >= 0")
 	}
@@ -104,6 +103,19 @@ func Run(cfg Config) (Stats, error) {
 	}
 	if cfg.AutoTuneDuration <= 0 {
 		cfg.AutoTuneDuration = defaultAutoTuneDuration
+	}
+
+	if cfg.InPlace {
+		if cfg.SourceDir == "" {
+			return stats, errors.New("--source is required when --in-place is set")
+		}
+		if cfg.ReferenceDir != "" {
+			return stats, errors.New("--reference must be empty when --in-place is set")
+		}
+		return runInPlace(cfg, start)
+	}
+	if cfg.SourceDir == "" || cfg.ReferenceDir == "" {
+		return stats, errors.New("both --source and --reference are required")
 	}
 
 	sourceAbs, err := filepath.Abs(cfg.SourceDir)
@@ -218,6 +230,106 @@ func Run(cfg Config) (Stats, error) {
 		toDelete = append(toDelete, deleteItem{Path: s.Meta.Path, Size: s.Meta.Size})
 		stats.MatchedFiles++
 		stats.BytesReclaimable += s.Meta.Size
+	}
+
+	if cfg.Apply && len(toDelete) > 0 {
+		deleted, bytesDeleted, deleteErrors := deleteInBatches(toDelete, cfg.BatchSize, cfg.Workers)
+		stats.DeletedFiles = deleted
+		stats.BytesDeleted = bytesDeleted
+		stats.DeleteErrors = deleteErrors
+	}
+
+	stats.Duration = time.Since(start)
+	return stats, nil
+}
+
+func runInPlace(cfg Config, start time.Time) (Stats, error) {
+	var stats Stats
+
+	sourceAbs, err := filepath.Abs(cfg.SourceDir)
+	if err != nil {
+		return stats, fmt.Errorf("resolve source path: %w", err)
+	}
+	sourceAbs = filepath.Clean(sourceAbs)
+
+	sourceFiles, err := walkRegularFiles(sourceAbs)
+	if err != nil {
+		return stats, err
+	}
+	stats.SourceFiles = len(sourceFiles)
+
+	sizeCounts := make(map[int64]int, len(sourceFiles))
+	for _, f := range sourceFiles {
+		sizeCounts[f.Size]++
+	}
+	duplicateSizes := make(map[int64]struct{}, len(sizeCounts))
+	for size, count := range sizeCounts {
+		if count > 1 {
+			duplicateSizes[size] = struct{}{}
+		}
+	}
+
+	sourceCandidates := filterBySize(sourceFiles, duplicateSizes)
+	stats.CandidateSourceFiles = len(sourceCandidates)
+
+	if cfg.Workers == 0 {
+		if len(sourceCandidates) > 0 {
+			cfg.Workers = autoTuneWorkers(sourceCandidates, cfg.Hash, cfg.AutoTuneDuration)
+		} else {
+			cfg.Workers = runtime.NumCPU()
+			if cfg.Workers < 1 {
+				cfg.Workers = 1
+			}
+		}
+		stats.AutoTunedWorkers = true
+	}
+	if cfg.BatchSize == 0 {
+		cfg.BatchSize = autoBatchSize(cfg.Workers)
+		stats.AutoTunedBatchSize = true
+	}
+	stats.WorkersUsed = cfg.Workers
+	stats.BatchSizeUsed = cfg.BatchSize
+
+	if len(sourceCandidates) == 0 {
+		stats.Duration = time.Since(start)
+		return stats, nil
+	}
+
+	sourceHashed, err := hashFiles(sourceCandidates, cfg.Workers, cfg.Hash)
+	if err != nil {
+		return stats, err
+	}
+	stats.HashedSourceFiles = len(sourceHashed)
+
+	groups := make(map[hashKey][]fileMeta, len(sourceHashed))
+	for _, h := range sourceHashed {
+		key := hashKey{Size: h.Meta.Size, Sum: h.Sum}
+		groups[key] = append(groups[key], h.Meta)
+	}
+
+	toDelete := make([]deleteItem, 0)
+	for _, group := range groups {
+		if len(group) < 2 {
+			continue
+		}
+		sort.Slice(group, func(i, j int) bool {
+			return group[i].Path < group[j].Path
+		})
+		keep := group[0]
+		for _, candidate := range group[1:] {
+			if cfg.Verify {
+				eq, err := filesEqual(candidate.Path, keep.Path)
+				if err != nil {
+					return stats, fmt.Errorf("compare %s and %s: %w", candidate.Path, keep.Path, err)
+				}
+				if !eq {
+					continue
+				}
+			}
+			toDelete = append(toDelete, deleteItem{Path: candidate.Path, Size: candidate.Size})
+			stats.MatchedFiles++
+			stats.BytesReclaimable += candidate.Size
+		}
 	}
 
 	if cfg.Apply && len(toDelete) > 0 {
@@ -517,7 +629,9 @@ func autoTuneWorkers(files []fileMeta, algorithm string, budget time.Duration) i
 	bestThroughput := float64(-1)
 	for _, workers := range candidates {
 		throughput := probeHashThroughput(samples, workers, algorithm, perCandidate)
-		if throughput > bestThroughput {
+		// Prefer higher worker counts when throughput ties, avoiding a persistent
+		// bias toward the first candidate (1 worker).
+		if throughput > bestThroughput || (throughput == bestThroughput && workers > bestWorkers) {
 			bestThroughput = throughput
 			bestWorkers = workers
 		}
@@ -582,24 +696,31 @@ func probeHashThroughput(samples []fileMeta, workers int, algorithm string, dura
 	if workers < 1 || len(samples) == 0 || duration <= 0 {
 		return 0
 	}
-	var counter uint64
 	var bytesProcessed atomic.Int64
 	deadline := time.Now().Add(duration)
 
 	var wg sync.WaitGroup
 	wg.Add(workers)
 	for i := 0; i < workers; i++ {
-		go func() {
+		go func(workerIdx int) {
 			defer wg.Done()
+			var localBytes int64
+			sampleIdx := workerIdx % len(samples)
 			for time.Now().Before(deadline) {
-				n := atomic.AddUint64(&counter, 1)
-				f := samples[int((n-1)%uint64(len(samples)))]
+				f := samples[sampleIdx]
+				sampleIdx++
+				if sampleIdx >= len(samples) {
+					sampleIdx = 0
+				}
 				_, err := hashFile(f.Path, algorithm)
 				if err == nil {
-					bytesProcessed.Add(f.Size)
+					localBytes += f.Size
 				}
 			}
-		}()
+			if localBytes > 0 {
+				bytesProcessed.Add(localBytes)
+			}
+		}(i)
 	}
 	wg.Wait()
 
