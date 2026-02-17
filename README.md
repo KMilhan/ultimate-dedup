@@ -12,6 +12,8 @@ It is content-based only:
 
 > Oh, it's already there? We don't need this.
 
+*(It also supports in-the-same directory dedup!)*
+
 Ultimate Dedup does this really fast.
 
 Given:
@@ -25,6 +27,12 @@ The tool:
 4. Hashes candidates (`xxh3-128` by default, or `sha256`).
 5. Optionally verifies bytes (`on` by default).
 6. Deletes matching files only from `A`.
+
+With `--in-place`:
+1. Scans `A` recursively.
+2. Groups by size and content hash.
+3. Keeps one deterministic file per content group.
+4. Deletes the other duplicates from `A`.
 
 ## Safety Defaults
 
@@ -45,37 +53,52 @@ Dry-run:
 
 ```bash
 ./ultimate-dedup \
-  -source /path/to/source \
-  -reference /path/to/target
+  --source /path/to/source \
+  --reference /path/to/target
 ```
 
 Apply deletion:
 
 ```bash
 ./ultimate-dedup \
-  -source /path/to/source \
-  -reference /path/to/target \
-  -apply
+  --source /path/to/source \
+  --reference /path/to/target \
+  --apply
+```
+
+In-place dedup (single directory):
+
+```bash
+./ultimate-dedup \
+  --source /path/to/dir \
+  --in-place \
+  --apply
 ```
 
 ## CLI Flags
 
 ```text
--source string
+--source string
     source directory A (files are deleted from here)
--reference string
+--reference string
     reference directory B (read-only reference)
--apply
+--in-place
+    deduplicate within source only; keep one file per content group
+--apply
     apply deletions; default is dry-run
--hash string
+--hash string
     hash algorithm: xxh3-128|sha256 (default "xxh3-128")
--no-verify
+--no-verify
     disable byte-by-byte verification (faster, less safe)
--workers int
+--workers int
     number of hashing and delete workers; 0 auto-tune (~1s)
--batch-size int
+--batch-size int
     max deletes per batch; 0 auto
 ```
+
+Notes:
+- Default mode (without `--in-place`) requires both `--source` and `--reference`.
+- In in-place mode (`--in-place`), `--reference` must not be provided.
 
 ## Examples
 
@@ -83,21 +106,21 @@ Use explicit tuning:
 
 ```bash
 ./ultimate-dedup \
-  -source /data/source \
-  -reference /data/reference \
-  -workers 16 \
-  -batch-size 5000 \
-  -apply
+  --source /data/source \
+  --reference /data/reference \
+  --workers 16 \
+  --batch-size 5000 \
+  --apply
 ```
 
 Use SHA-256:
 
 ```bash
 ./ultimate-dedup \
-  -source /data/source \
-  -reference /data/reference \
-  -hash sha256 \
-  -apply
+  --source /data/source \
+  --reference /data/reference \
+  --hash sha256 \
+  --apply
 ```
 
 ## End-to-End Scenario Runner

@@ -20,6 +20,9 @@ func TestParseHelp(t *testing.T) {
 	if out.Len() == 0 {
 		t.Fatalf("expected usage text output")
 	}
+	if !strings.Contains(out.String(), "--source") {
+		t.Fatalf("expected GNU-style long flags in usage output, got %q", out.String())
+	}
 }
 
 func TestParseUnexpectedPositionalArgs(t *testing.T) {
@@ -55,6 +58,26 @@ func TestParseMapsFlags(t *testing.T) {
 	}
 }
 
+func TestParseInPlaceMapsFlags(t *testing.T) {
+	var out bytes.Buffer
+	parsed, err := Parse([]string{
+		"-source", "/a",
+		"-in-place",
+	}, &out)
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if parsed.cfg.SourceDir != "/a" {
+		t.Fatalf("unexpected source mapping")
+	}
+	if !parsed.cfg.InPlace {
+		t.Fatalf("expected in-place mode to be enabled")
+	}
+	if parsed.cfg.ReferenceDir != "" {
+		t.Fatalf("expected empty reference in in-place mode parse")
+	}
+}
+
 func TestRunParseError(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -64,6 +87,28 @@ func TestRunParseError(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "error:") {
 		t.Fatalf("expected stderr error output, got %q", stderr.String())
+	}
+}
+
+func TestRunNoArgsShowsGuidance(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := Run(nil, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
+	}
+	errOut := stderr.String()
+	for _, token := range []string{
+		"removes files by content match",
+		"Modes:",
+		"Examples:",
+		"Usage of ultimate-dedup:",
+		"--source",
+		"--reference",
+	} {
+		if !strings.Contains(errOut, token) {
+			t.Fatalf("expected stderr to contain %q, got %q", token, errOut)
+		}
 	}
 }
 
@@ -150,6 +195,38 @@ func TestRunApplySummaryIncludesDeleteLine(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "deleted: 1 files") {
 		t.Fatalf("expected apply summary delete line, got %q", stdout.String())
+	}
+}
+
+func TestRunInPlaceSuccessAndSummary(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "A")
+	mustMkdirAll(t, source)
+
+	mustWriteFile(t, filepath.Join(source, "a.txt"), []byte("hello"))
+	mustWriteFile(t, filepath.Join(source, "b.txt"), []byte("hello"))
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := Run([]string{
+		"-source", source,
+		"-in-place",
+		"-workers", "1",
+		"-batch-size", "10",
+	}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d stderr=%q", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, token := range []string{
+		"mode: dry-run",
+		"scope: in-place",
+		"matched in source: 1",
+	} {
+		if !strings.Contains(out, token) {
+			t.Fatalf("expected output to contain %q, got: %s", token, out)
+		}
 	}
 }
 
