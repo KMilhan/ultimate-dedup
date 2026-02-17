@@ -90,6 +90,10 @@ In-place dedup (single directory):
     hash algorithm: xxh3-128|sha256 (default "xxh3-128")
 --no-verify
     disable byte-by-byte verification (faster, less safe)
+--verbose
+    enable basic phase logs on stderr
+--progress
+    show progress updates for hashing and deletes
 --workers int
     number of hashing and delete workers; 0 auto-tune (~1s)
 --batch-size int
@@ -99,6 +103,7 @@ In-place dedup (single directory):
 Notes:
 - Default mode (without `--in-place`) requires both `--source` and `--reference`.
 - In in-place mode (`--in-place`), `--reference` must not be provided.
+- `--verbose` and `--progress` write logs to `stderr`; summary output remains on `stdout`.
 
 ## Examples
 

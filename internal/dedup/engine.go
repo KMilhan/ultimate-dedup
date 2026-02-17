@@ -35,6 +35,9 @@ type Config struct {
 	Hash             string
 	Apply            bool
 	Verify           bool
+	Verbose          bool
+	Progress         bool
+	Logf             func(format string, args ...any)
 	AutoTuneDuration time.Duration
 }
 
@@ -85,6 +88,67 @@ var hashBufferPool = sync.Pool{
 	},
 }
 
+func (cfg Config) verbosef(format string, args ...any) {
+	if cfg.Verbose && cfg.Logf != nil {
+		cfg.Logf("info: "+format, args...)
+	}
+}
+
+func (cfg Config) progressf(format string, args ...any) {
+	if cfg.Progress && cfg.Logf != nil {
+		cfg.Logf("progress: "+format, args...)
+	}
+}
+
+type progressReporter struct {
+	cfg      Config
+	label    string
+	total    int
+	started  time.Time
+	lastEmit time.Time
+}
+
+func newProgressReporter(cfg Config, label string, total int) *progressReporter {
+	if !cfg.Progress || cfg.Logf == nil || total <= 0 {
+		return nil
+	}
+	cfg.progressf("%s: 0/%d (0%%)", label, total)
+	now := time.Now()
+	return &progressReporter{
+		cfg:      cfg,
+		label:    label,
+		total:    total,
+		started:  now,
+		lastEmit: now,
+	}
+}
+
+func (p *progressReporter) step(done int) {
+	if p == nil {
+		return
+	}
+	if done < 0 {
+		done = 0
+	}
+	if done > p.total {
+		done = p.total
+	}
+	now := time.Now()
+	if done != p.total && now.Sub(p.lastEmit) < 500*time.Millisecond {
+		return
+	}
+	p.lastEmit = now
+	percent := float64(done) * 100 / float64(p.total)
+	p.cfg.progressf(
+		"%s: %d/%d (%.0f%% elapsed=%s)",
+		p.label,
+		done,
+		p.total,
+		percent,
+		time.Since(p.started).Round(time.Millisecond),
+	)
+}
+
 func Run(cfg Config) (Stats, error) {
 	start := time.Now()
 	var stats Stats
@@ -104,6 +168,18 @@ func Run(cfg Config) (Stats, error) {
 	if cfg.AutoTuneDuration <= 0 {
 		cfg.AutoTuneDuration = defaultAutoTuneDuration
 	}
+	cfg.verbosef(
+		"starting run: mode=%s apply=%t verify=%t hash=%s",
+		func() string {
+			if cfg.InPlace {
+				return "in-place"
+			}
+			return "source-vs-reference"
+		}(),
+		cfg.Apply,
+		cfg.Verify,
+		cfg.Hash,
+	)
 
 	if cfg.InPlace {
 		if cfg.SourceDir == "" {
@@ -136,25 +212,30 @@ func Run(cfg Config) (Stats, error) {
 		return stats, errors.New("source and reference must not overlap")
 	}
 
+	cfg.verbosef("scanning source: %s", sourceAbs)
 	sourceFiles, err := walkRegularFiles(sourceAbs)
 	if err != nil {
 		return stats, err
 	}
 	stats.SourceFiles = len(sourceFiles)
+	cfg.verbosef("scanned source files: %d", stats.SourceFiles)
 
 	sourceSizes := make(map[int64]struct{}, len(sourceFiles))
 	for _, f := range sourceFiles {
 		sourceSizes[f.Size] = struct{}{}
 	}
 
+	cfg.verbosef("scanning reference: %s", refAbs)
 	referenceFiles, err := walkRegularFiles(refAbs)
 	if err != nil {
 		return stats, err
 	}
 	stats.ReferenceFiles = len(referenceFiles)
+	cfg.verbosef("scanned reference files: %d", stats.ReferenceFiles)
 
 	refCandidates := filterBySize(referenceFiles, sourceSizes)
 	stats.CandidateReferenceFiles = len(refCandidates)
+	cfg.verbosef("reference candidates by size: %d", stats.CandidateReferenceFiles)
 	if len(refCandidates) == 0 {
 		if cfg.Workers == 0 {
 			cfg.Workers = runtime.NumCPU()
@@ -170,10 +251,12 @@ func Run(cfg Config) (Stats, error) {
 		stats.WorkersUsed = cfg.Workers
 		stats.BatchSizeUsed = cfg.BatchSize
 		stats.Duration = time.Since(start)
+		cfg.verbosef("no reference candidates found; finishing early")
 		return stats, nil
 	}
 
 	if cfg.Workers == 0 {
+		cfg.verbosef("auto-tuning workers")
 		cfg.Workers = autoTuneWorkers(refCandidates, cfg.Hash, cfg.AutoTuneDuration)
 		stats.AutoTunedWorkers = true
 	}
@@ -183,12 +266,16 @@ func Run(cfg Config) (Stats, error) {
 	}
 	stats.WorkersUsed = cfg.Workers
 	stats.BatchSizeUsed = cfg.BatchSize
+	cfg.verbosef("using workers=%d batch-size=%d", stats.WorkersUsed, stats.BatchSizeUsed)
 
-	refHashed, err := hashFiles(refCandidates, cfg.Workers, cfg.Hash)
+	cfg.verbosef("hashing reference candidates")
+	refProgress := newProgressReporter(cfg, "hash reference", len(refCandidates))
+	refHashed, err := hashFiles(refCandidates, cfg.Workers, cfg.Hash, refProgress.step)
 	if err != nil {
 		return stats, err
 	}
 	stats.HashedReferenceFiles = len(refHashed)
+	cfg.verbosef("hashed reference candidates: %d", stats.HashedReferenceFiles)
 
 	refIndex := make(map[hashKey][]string, len(refHashed))
 	refHashedSizes := make(map[int64]struct{})
@@ -200,16 +287,21 @@ func Run(cfg Config) (Stats, error) {
 
 	sourceCandidates := filterBySize(sourceFiles, refHashedSizes)
 	stats.CandidateSourceFiles = len(sourceCandidates)
+	cfg.verbosef("source candidates by size: %d", stats.CandidateSourceFiles)
 	if len(sourceCandidates) == 0 {
 		stats.Duration = time.Since(start)
+		cfg.verbosef("no source candidates found; finishing early")
 		return stats, nil
 	}
 
-	sourceHashed, err := hashFiles(sourceCandidates, cfg.Workers, cfg.Hash)
+	cfg.verbosef("hashing source candidates")
+	sourceProgress := newProgressReporter(cfg, "hash source", len(sourceCandidates))
+	sourceHashed, err := hashFiles(sourceCandidates, cfg.Workers, cfg.Hash, sourceProgress.step)
 	if err != nil {
 		return stats, err
 	}
 	stats.HashedSourceFiles = len(sourceHashed)
+	cfg.verbosef("hashed source candidates: %d", stats.HashedSourceFiles)
 
 	toDelete := make([]deleteItem, 0)
 	for _, s := range sourceHashed {
@@ -231,15 +323,31 @@ func Run(cfg Config) (Stats, error) {
 		stats.MatchedFiles++
 		stats.BytesReclaimable += s.Meta.Size
 	}
+	cfg.verbosef(
+		"matched source files: %d reclaimable=%s",
+		stats.MatchedFiles,
+		FormatBytes(stats.BytesReclaimable),
+	)
 
 	if cfg.Apply && len(toDelete) > 0 {
-		deleted, bytesDeleted, deleteErrors := deleteInBatches(toDelete, cfg.BatchSize, cfg.Workers)
+		cfg.verbosef("deleting matched files: %d", len(toDelete))
+		deleteProgress := newProgressReporter(cfg, "delete", len(toDelete))
+		deleted, bytesDeleted, deleteErrors := deleteInBatches(toDelete, cfg.BatchSize, cfg.Workers, deleteProgress.step)
 		stats.DeletedFiles = deleted
 		stats.BytesDeleted = bytesDeleted
 		stats.DeleteErrors = deleteErrors
+		cfg.verbosef(
+			"delete completed: deleted=%d errors=%d reclaimed=%s",
+			stats.DeletedFiles,
+			stats.DeleteErrors,
+			FormatBytes(stats.BytesDeleted),
+		)
+	} else if cfg.Apply {
+		cfg.verbosef("no files to delete")
 	}
 
 	stats.Duration = time.Since(start)
+	cfg.verbosef("finished in %s", stats.Duration.Round(time.Millisecond))
 	return stats, nil
 }
 
@@ -252,11 +360,13 @@ func runInPlace(cfg Config, start time.Time) (Stats, error) {
 	}
 	sourceAbs = filepath.Clean(sourceAbs)
 
+	cfg.verbosef("scanning source: %s", sourceAbs)
 	sourceFiles, err := walkRegularFiles(sourceAbs)
 	if err != nil {
 		return stats, err
 	}
 	stats.SourceFiles = len(sourceFiles)
+	cfg.verbosef("scanned source files: %d", stats.SourceFiles)
 
 	sizeCounts := make(map[int64]int, len(sourceFiles))
 	for _, f := range sourceFiles {
@@ -271,9 +381,11 @@ func runInPlace(cfg Config, start time.Time) (Stats, error) {
 
 	sourceCandidates := filterBySize(sourceFiles, duplicateSizes)
 	stats.CandidateSourceFiles = len(sourceCandidates)
+	cfg.verbosef("source candidates by size: %d", stats.CandidateSourceFiles)
 
 	if cfg.Workers == 0 {
 		if len(sourceCandidates) > 0 {
+			cfg.verbosef("auto-tuning workers")
 			cfg.Workers = autoTuneWorkers(sourceCandidates, cfg.Hash, cfg.AutoTuneDuration)
 		} else {
 			cfg.Workers = runtime.NumCPU()
@@ -289,17 +401,22 @@ func runInPlace(cfg Config, start time.Time) (Stats, error) {
 	}
 	stats.WorkersUsed = cfg.Workers
 	stats.BatchSizeUsed = cfg.BatchSize
+	cfg.verbosef("using workers=%d batch-size=%d", stats.WorkersUsed, stats.BatchSizeUsed)
 
 	if len(sourceCandidates) == 0 {
 		stats.Duration = time.Since(start)
+		cfg.verbosef("no candidates found; finishing early")
 		return stats, nil
 	}
 
-	sourceHashed, err := hashFiles(sourceCandidates, cfg.Workers, cfg.Hash)
+	cfg.verbosef("hashing source candidates")
+	sourceProgress := newProgressReporter(cfg, "hash source", len(sourceCandidates))
+	sourceHashed, err := hashFiles(sourceCandidates, cfg.Workers, cfg.Hash, sourceProgress.step)
 	if err != nil {
 		return stats, err
 	}
 	stats.HashedSourceFiles = len(sourceHashed)
+	cfg.verbosef("hashed source candidates: %d", stats.HashedSourceFiles)
 
 	groups := make(map[hashKey][]fileMeta, len(sourceHashed))
 	for _, h := range sourceHashed {
@@ -331,15 +448,31 @@ func runInPlace(cfg Config, start time.Time) (Stats, error) {
 			stats.BytesReclaimable += candidate.Size
 		}
 	}
+	cfg.verbosef(
+		"matched source files: %d reclaimable=%s",
+		stats.MatchedFiles,
+		FormatBytes(stats.BytesReclaimable),
+	)
 
 	if cfg.Apply && len(toDelete) > 0 {
-		deleted, bytesDeleted, deleteErrors := deleteInBatches(toDelete, cfg.BatchSize, cfg.Workers)
+		cfg.verbosef("deleting matched files: %d", len(toDelete))
+		deleteProgress := newProgressReporter(cfg, "delete", len(toDelete))
+		deleted, bytesDeleted, deleteErrors := deleteInBatches(toDelete, cfg.BatchSize, cfg.Workers, deleteProgress.step)
 		stats.DeletedFiles = deleted
 		stats.BytesDeleted = bytesDeleted
 		stats.DeleteErrors = deleteErrors
+		cfg.verbosef(
+			"delete completed: deleted=%d errors=%d reclaimed=%s",
+			stats.DeletedFiles,
+			stats.DeleteErrors,
+			FormatBytes(stats.BytesDeleted),
+		)
+	} else if cfg.Apply {
+		cfg.verbosef("no files to delete")
 	}
 
 	stats.Duration = time.Since(start)
+	cfg.verbosef("finished in %s", stats.Duration.Round(time.Millisecond))
 	return stats, nil
 }
 
@@ -378,7 +511,7 @@ func filterBySize(files []fileMeta, sizes map[int64]struct{}) []fileMeta {
 	return out
 }
 
-func hashFiles(files []fileMeta, workers int, algorithm string) ([]fileHash, error) {
+func hashFiles(files []fileMeta, workers int, algorithm string, onProgress func(done int)) ([]fileHash, error) {
 	if len(files) == 0 {
 		return nil, nil
 	}
@@ -412,7 +545,12 @@ func hashFiles(files []fileMeta, workers int, algorithm string) ([]fileHash, err
 
 	out := make([]fileHash, 0, len(files))
 	var firstErr error
+	done := 0
 	for r := range results {
+		done++
+		if onProgress != nil {
+			onProgress(done)
+		}
 		if r.Err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("hash %s: %w", r.Meta.Path, r.Err)
@@ -519,17 +657,23 @@ func filesEqual(aPath, bPath string) (bool, error) {
 	}
 }
 
-func deleteInBatches(items []deleteItem, batchSize, workers int) (int, int64, int) {
+func deleteInBatches(items []deleteItem, batchSize, workers int, onProgress func(done int)) (int, int64, int) {
 	totalDeleted := 0
 	var totalBytes int64
 	totalErrors := 0
+	processed := 0
 
 	for i := 0; i < len(items); i += batchSize {
 		end := i + batchSize
 		if end > len(items) {
 			end = len(items)
 		}
-		deleted, bytesDeleted, errs := deleteBatch(items[i:end], workers)
+		deleted, bytesDeleted, errs := deleteBatch(items[i:end], workers, func() {
+			processed++
+			if onProgress != nil {
+				onProgress(processed)
+			}
+		})
 		totalDeleted += deleted
 		totalBytes += bytesDeleted
 		totalErrors += errs
@@ -537,7 +681,7 @@ func deleteInBatches(items []deleteItem, batchSize, workers int) (int, int64, in
 	return totalDeleted, totalBytes, totalErrors
 }
 
-func deleteBatch(items []deleteItem, workers int) (int, int64, int) {
+func deleteBatch(items []deleteItem, workers int, onItemProcessed func()) (int, int64, int) {
 	type result struct {
 		item deleteItem
 		err  error
@@ -571,6 +715,9 @@ func deleteBatch(items []deleteItem, workers int) (int, int64, int) {
 	var bytesDeleted int64
 	deleteErrors := 0
 	for r := range results {
+		if onItemProcessed != nil {
+			onItemProcessed()
+		}
 		if r.err != nil {
 			deleteErrors++
 			continue

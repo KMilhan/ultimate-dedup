@@ -26,6 +26,8 @@ type flagValues struct {
 	hash      *string
 	apply     *bool
 	noVerify  *bool
+	verbose   *bool
+	progress  *bool
 }
 
 func newFlagSet(out io.Writer) (*flag.FlagSet, flagValues) {
@@ -41,6 +43,8 @@ func newFlagSet(out io.Writer) (*flag.FlagSet, flagValues) {
 		hash:      fs.String("hash", dedup.HashXXH3_128, "hash algorithm: xxh3-128|sha256"),
 		apply:     fs.Bool("apply", false, "apply deletions; default is dry-run"),
 		noVerify:  fs.Bool("no-verify", false, "disable byte-by-byte verification (faster, less safe)"),
+		verbose:   fs.Bool("verbose", false, "enable basic phase logs on stderr"),
+		progress:  fs.Bool("progress", false, "show progress updates for hashing and deletes"),
 	}
 
 	fs.Usage = func() {
@@ -89,6 +93,8 @@ func Parse(args []string, out io.Writer) (parsedArgs, error) {
 			Hash:             *values.hash,
 			Apply:            *values.apply,
 			Verify:           !*values.noVerify,
+			Verbose:          *values.verbose,
+			Progress:         *values.progress,
 			AutoTuneDuration: time.Second,
 		},
 	}, nil
@@ -126,6 +132,10 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	if parsed.help {
 		return 0
+	}
+
+	parsed.cfg.Logf = func(format string, args ...any) {
+		fmt.Fprintf(stderr, format+"\n", args...)
 	}
 
 	stats, err := dedup.Run(parsed.cfg)

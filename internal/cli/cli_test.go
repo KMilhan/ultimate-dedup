@@ -43,6 +43,8 @@ func TestParseMapsFlags(t *testing.T) {
 		"-hash", "sha256",
 		"-apply",
 		"-no-verify",
+		"-verbose",
+		"-progress",
 	}, &out)
 	if err != nil {
 		t.Fatalf("Parse returned error: %v", err)
@@ -55,6 +57,9 @@ func TestParseMapsFlags(t *testing.T) {
 	}
 	if parsed.cfg.Hash != "sha256" || !parsed.cfg.Apply || parsed.cfg.Verify {
 		t.Fatalf("unexpected hash/apply/verify mapping: %#v", parsed.cfg)
+	}
+	if !parsed.cfg.Verbose || !parsed.cfg.Progress {
+		t.Fatalf("expected verbose and progress flags to map: %#v", parsed.cfg)
 	}
 }
 
@@ -195,6 +200,41 @@ func TestRunApplySummaryIncludesDeleteLine(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "deleted: 1 files") {
 		t.Fatalf("expected apply summary delete line, got %q", stdout.String())
+	}
+}
+
+func TestRunVerboseAndProgressWritesLogs(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "A")
+	reference := filepath.Join(root, "B")
+	mustMkdirAll(t, source)
+	mustMkdirAll(t, reference)
+
+	mustWriteFile(t, filepath.Join(source, "a.txt"), []byte("hello"))
+	mustWriteFile(t, filepath.Join(reference, "b.txt"), []byte("hello"))
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := Run([]string{
+		"-source", source,
+		"-reference", reference,
+		"-workers", "1",
+		"-batch-size", "10",
+		"-verbose",
+		"-progress",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d stderr=%q", code, stderr.String())
+	}
+	errOut := stderr.String()
+	for _, token := range []string{
+		"info: starting run:",
+		"progress: hash reference:",
+		"progress: hash source:",
+	} {
+		if !strings.Contains(errOut, token) {
+			t.Fatalf("expected stderr to contain %q, got %q", token, errOut)
+		}
 	}
 }
 

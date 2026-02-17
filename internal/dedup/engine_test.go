@@ -1,9 +1,11 @@
 package dedup
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -417,7 +419,7 @@ func TestWalkRegularFilesError(t *testing.T) {
 
 func TestHashFilesErrorPath(t *testing.T) {
 	files := []fileMeta{{Path: "/definitely/missing/file", Size: 123}}
-	_, err := hashFiles(files, 1, HashXXH3_128)
+	_, err := hashFiles(files, 1, HashXXH3_128, nil)
 	if err == nil {
 		t.Fatalf("expected hashFiles error")
 	}
@@ -467,6 +469,48 @@ func TestRunNoVerifyBranchAndDefaults(t *testing.T) {
 	}
 	if stats.MatchedFiles != 1 {
 		t.Fatalf("expected match with no verify, got %d", stats.MatchedFiles)
+	}
+}
+
+func TestRunVerboseAndProgressLoggingHooks(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "A")
+	reference := filepath.Join(root, "B")
+	mustMkdirAll(t, source)
+	mustMkdirAll(t, reference)
+
+	mustWriteFile(t, filepath.Join(source, "a.txt"), []byte("same"))
+	mustWriteFile(t, filepath.Join(reference, "b.txt"), []byte("same"))
+
+	var logs []string
+	stats, err := Run(Config{
+		SourceDir:    source,
+		ReferenceDir: reference,
+		Workers:      1,
+		BatchSize:    1,
+		Hash:         HashXXH3_128,
+		Verify:       true,
+		Verbose:      true,
+		Progress:     true,
+		Logf: func(format string, args ...any) {
+			logs = append(logs, fmt.Sprintf(format, args...))
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if stats.MatchedFiles != 1 {
+		t.Fatalf("expected one matched file, got %d", stats.MatchedFiles)
+	}
+	joined := strings.Join(logs, "\n")
+	for _, token := range []string{
+		"info: starting run:",
+		"progress: hash reference:",
+		"progress: hash source:",
+	} {
+		if !strings.Contains(joined, token) {
+			t.Fatalf("expected logs to contain %q, got %q", token, joined)
+		}
 	}
 }
 
